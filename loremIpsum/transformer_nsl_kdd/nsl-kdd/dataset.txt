@@ -70,6 +70,50 @@ np.random.seed(RANDOM_STATE)
 tf.random.set_seed(RANDOM_STATE)
 
 # =========================
+# GPU detection & configuration
+# =========================
+import time
+START_TIME = time.time()
+
+
+def log(msg):
+    """Timestamped progress print — every major step in this script calls
+    this so you can see exactly what's running and how long each stage
+    took, rather than the notebook going silent for minutes at a time."""
+    elapsed = time.time() - START_TIME
+    print(f"[{elapsed:8.2f}s] {msg}", flush=True)
+
+
+log("Checking for GPU...")
+gpus = tf.config.list_physical_devices('GPU')
+log(f"TensorFlow built with CUDA support: {tf.test.is_built_with_cuda()}")
+if gpus:
+    for gpu in gpus:
+        try:
+            # Memory growth = TF allocates VRAM incrementally as needed
+            # instead of claiming ~all of it upfront. Must be set before
+            # any op touches the GPU, which is why this runs immediately
+            # after import. This is also what keeps TF from starving out
+            # other GPU consumers in the same process (relevant if you
+            # ever mix in a PyTorch-based library again).
+            tf.config.experimental.set_memory_growth(gpu, True)
+        except RuntimeError as e:
+            log(f"Could not set memory growth on {gpu.name} (GPU already "
+                f"initialized elsewhere?): {e}")
+    log(f"Found {len(gpus)} GPU(s): {[g.name for g in gpus]}")
+    with tf.device(gpus[0].name.replace('/physical_device:', '/')):
+        _test_tensor = tf.constant([1.0])
+    log(f"Test tensor placed on: {_test_tensor.device}")
+else:
+    log("No GPU detected by TensorFlow. Training will run on CPU, which will "
+        "be noticeably slower for the Transformer models. If you expect a "
+        "GPU here, verify: (1) `nvidia-smi` shows the GPU and driver, "
+        "(2) your TensorFlow build matches your installed CUDA/cuDNN "
+        "version — check with `pip show tensorflow` and TF's install guide.")
+
+log(f"Logical devices available: {tf.config.list_logical_devices()}")
+
+# =========================
 # Config
 # =========================
 TRAIN_PATH = "nsl-kdd/KDDTrain+.txt"
@@ -137,8 +181,11 @@ def load_nslkdd(file_path):
     return df
 
 
+log("Loading NSL-KDD train/test files...")
 train_raw = load_nslkdd(TRAIN_PATH)
 test_raw = load_nslkdd(TEST_PATH)
+log(f"Train loaded: {train_raw.shape[0]} rows, {train_raw.shape[1]} columns")
+log(f"Test loaded: {test_raw.shape[0]} rows, {test_raw.shape[1]} columns")
 
 # =========================
 # Label mapping (complete, asserted; 'spy' -> R2L)
@@ -165,6 +212,7 @@ assert train_raw['attack_type'].isna().sum() == 0, \
     f"Unmapped train labels: {train_raw.loc[train_raw['attack_type'].isna(), 'labels'].unique()}"
 assert test_raw['attack_type'].isna().sum() == 0, \
     f"Unmapped test labels: {test_raw.loc[test_raw['attack_type'].isna(), 'labels'].unique()}"
+log("Label mapping complete, all labels matched (assertion passed).")
 
 train_raw['binary_label'] = (train_raw['labels'] != 'normal').astype(int)
 test_raw['binary_label'] = (test_raw['labels'] != 'normal').astype(int)
@@ -183,18 +231,23 @@ print("\nTest attack_type distribution:\n", test_raw['attack_type'].value_counts
 # =========================
 # log1p on skewed columns
 # =========================
+log(f"Applying log1p to {len(skewed_cols)} skewed columns: {skewed_cols}")
 for c in skewed_cols:
     train_raw[c] = np.log1p(train_raw[c].astype(np.float32))
     test_raw[c] = np.log1p(test_raw[c].astype(np.float32))
+log("log1p transform complete.")
 
 # =========================
 # One-hot encode categorical columns (TRAIN-ONLY schema)
 # =========================
+log("One-hot encoding categorical columns (train-only schema)...")
 train_ohe = pd.get_dummies(train_raw[feature_cols], columns=categorical_cols, drop_first=True)
 ohe_columns = train_ohe.columns.tolist()
+log(f"One-hot encoding produced {len(ohe_columns)} columns from {len(feature_cols)} original features.")
 
 test_ohe = pd.get_dummies(test_raw[feature_cols], columns=categorical_cols, drop_first=True)
 test_ohe = test_ohe.reindex(columns=ohe_columns, fill_value=0)
+log("Test set reindexed onto train-derived one-hot schema.")
 
 # =========================
 # Drop zero-variance features (train-derived)
@@ -202,6 +255,7 @@ test_ohe = test_ohe.reindex(columns=ohe_columns, fill_value=0)
 zero_var_cols = [c for c in train_ohe.columns if train_ohe[c].nunique() <= 1]
 train_ohe.drop(columns=zero_var_cols, inplace=True)
 test_ohe.drop(columns=zero_var_cols, inplace=True)
+log(f"Dropped {len(zero_var_cols)} zero-variance columns: {zero_var_cols}")
 
 # =========================
 # Drop highly collinear features (train-derived)
@@ -211,22 +265,28 @@ upper = corr_matrix.where(np.triu(np.ones(corr_matrix.shape), k=1).astype(bool))
 to_drop_corr = [col for col in upper.columns if any(upper[col] > 0.95)]
 train_ohe.drop(columns=to_drop_corr, inplace=True)
 test_ohe.drop(columns=to_drop_corr, inplace=True)
+log(f"Dropped {len(to_drop_corr)} highly correlated (>0.95) columns: {to_drop_corr}")
+log(f"Feature matrix after cleanup: {train_ohe.shape[1]} columns remaining.")
 
 # =========================
 # Mutual information feature selection (union of binary + multiclass)
 # =========================
+log("Computing mutual information scores against binary label...")
 mi_bin = mutual_info_classif(train_ohe, train_raw['binary_label_enc'], random_state=RANDOM_STATE)
 mi_bin_df = pd.DataFrame({'feature': train_ohe.columns, 'mi_score': mi_bin}).sort_values('mi_score', ascending=False)
 top_bin = mi_bin_df.head(min(MI_TOP_N_BINARY, len(mi_bin_df)))['feature'].tolist()
+log(f"Top binary-MI feature: {mi_bin_df.iloc[0]['feature']} (score={mi_bin_df.iloc[0]['mi_score']:.4f})")
 
+log("Computing mutual information scores against multiclass label...")
 mi_multi = mutual_info_classif(train_ohe, train_raw['attack_type_enc'], random_state=RANDOM_STATE)
 mi_multi_df = pd.DataFrame({'feature': train_ohe.columns, 'mi_score': mi_multi}).sort_values('mi_score', ascending=False)
 top_multi = mi_multi_df.head(min(MI_TOP_N_MULTI, len(mi_multi_df)))['feature'].tolist()
+log(f"Top multiclass-MI feature: {mi_multi_df.iloc[0]['feature']} (score={mi_multi_df.iloc[0]['mi_score']:.4f})")
 
 selected_features = sorted(set(top_bin) | set(top_multi))
-print(f"\nSelected {len(selected_features)} features "
-      f"({len(top_bin)} from binary MI, {len(top_multi)} from multiclass MI, "
-      f"{len(set(top_bin) & set(top_multi))} overlap)")
+log(f"Selected {len(selected_features)} features "
+    f"({len(top_bin)} from binary MI, {len(top_multi)} from multiclass MI, "
+    f"{len(set(top_bin) & set(top_multi))} overlap)")
 
 train_sel = train_ohe[selected_features].copy()
 test_sel = test_ohe[selected_features].copy()
@@ -284,7 +344,9 @@ def smote_balance(X_df, y_series, target_counts=None, k_neighbors_max=SMOTE_K_NE
 
 
 # --- Binary: balance Normal vs Attack to match the majority ---
+log("Running SMOTE on binary labels (Normal vs Attack)...")
 X_bin_balanced, y_bin_balanced = smote_balance(train_sel, train_raw['binary_label_enc'])
+log(f"Binary balancing done: {len(train_sel)} -> {len(X_bin_balanced)} rows.")
 
 perm_bin = np.random.RandomState(RANDOM_STATE).permutation(len(X_bin_balanced))
 X_bin_balanced = X_bin_balanced.iloc[perm_bin].reset_index(drop=True)
@@ -297,21 +359,23 @@ u2r_cls = multi_encoder.transform(['U2R'])[0]
 multi_counts = train_raw['attack_type_enc'].value_counts()
 r2l_target = min(int(multi_counts.get(r2l_cls, 0) * R2L_TARGET_MULT), SMOTE_MAX_TARGET_R2L)
 u2r_target = min(int(multi_counts.get(u2r_cls, 0) * U2R_TARGET_MULT), SMOTE_MAX_TARGET_U2R)
-print(f"\nSMOTE targets — R2L: {multi_counts.get(r2l_cls, 0)} -> {r2l_target}, "
-      f"U2R: {multi_counts.get(u2r_cls, 0)} -> {u2r_target}")
+log(f"SMOTE targets — R2L: {multi_counts.get(r2l_cls, 0)} -> {r2l_target}, "
+    f"U2R: {multi_counts.get(u2r_cls, 0)} -> {u2r_target}")
 
+log("Running SMOTE on multiclass labels (targeting R2L/U2R only)...")
 X_multi_balanced, y_multi_balanced = smote_balance(
     train_sel, train_raw['attack_type_enc'],
     target_counts={r2l_cls: r2l_target, u2r_cls: u2r_target},
 )
+log(f"Multiclass balancing done: {len(train_sel)} -> {len(X_multi_balanced)} rows.")
 
 perm_multi = np.random.RandomState(RANDOM_STATE).permutation(len(X_multi_balanced))
 X_multi_balanced = X_multi_balanced.iloc[perm_multi].reset_index(drop=True)
 y_multi_balanced = y_multi_balanced.iloc[perm_multi].reset_index(drop=True)
 
-print("\nPost-SMOTE binary distribution:\n", y_bin_balanced.value_counts())
-print("\nPost-SMOTE multiclass distribution:\n",
-      y_multi_balanced.map(lambda i: multi_encoder.classes_[i]).value_counts())
+log(f"Post-SMOTE binary distribution: {y_bin_balanced.value_counts().to_dict()}")
+log(f"Post-SMOTE multiclass distribution: "
+    f"{y_multi_balanced.map(lambda i: multi_encoder.classes_[i]).value_counts().to_dict()}")
 
 # =========================
 # Save processed datasets
@@ -338,15 +402,19 @@ joblib.dump(ohe_columns, os.path.join(processed_dir, 'ohe_columns.pkl'))
 # =========================
 # Scaling
 # =========================
+log("Fitting StandardScaler for binary task (train-only)...")
 scaler_bin = StandardScaler()
 X_bin_bal_scaled = scaler_bin.fit_transform(X_bin_balanced.astype(np.float32))
 X_test_bin_scaled = scaler_bin.transform(test_sel.astype(np.float32))
 joblib.dump(scaler_bin, os.path.join(processed_dir, 'scaler_binary.pkl'))
+log(f"Binary features scaled: train shape {X_bin_bal_scaled.shape}, test shape {X_test_bin_scaled.shape}")
 
+log("Fitting StandardScaler for multiclass task (train-only)...")
 scaler_multi = StandardScaler()
 X_multi_bal_scaled = scaler_multi.fit_transform(X_multi_balanced.astype(np.float32))
 X_test_multi_scaled = scaler_multi.transform(test_sel.astype(np.float32))
 joblib.dump(scaler_multi, os.path.join(processed_dir, 'scaler_multi.pkl'))
+log(f"Multiclass features scaled: train shape {X_multi_bal_scaled.shape}, test shape {X_test_multi_scaled.shape}")
 
 # =========================
 # Train/val split
@@ -395,6 +463,13 @@ test_ds_bin = make_ds(X_test_bin, y_test_bin_cat, training=False)
 train_ds_multi = make_ds(X_multi_train, y_multi_train_cat, training=True)
 val_ds_multi = make_ds(X_multi_val, y_multi_val_cat, training=False)
 test_ds_multi = make_ds(X_test_multi, y_test_multi_cat, training=False)
+
+log(f"tf.data pipelines built. Binary: train={tf.data.experimental.cardinality(train_ds_bin).numpy()} "
+    f"batches, val={tf.data.experimental.cardinality(val_ds_bin).numpy()} batches, "
+    f"test={tf.data.experimental.cardinality(test_ds_bin).numpy()} batches (batch_size={BATCH_SIZE}).")
+log(f"Multiclass: train={tf.data.experimental.cardinality(train_ds_multi).numpy()} batches, "
+    f"val={tf.data.experimental.cardinality(val_ds_multi).numpy()} batches, "
+    f"test={tf.data.experimental.cardinality(test_ds_multi).numpy()} batches.")
 
 # =========================
 # Loss
@@ -494,6 +569,40 @@ class TransformerBlock(layers.Layer):
         return cfg
 
 
+class VerboseEpochLogger(tf.keras.callbacks.Callback):
+    """Prints timing, current learning rate (useful for watching
+    WarmupCosine actually warm up and decay), and all logged metrics at
+    the start/end of every epoch — gives full visibility into training
+    beyond Keras's default progress bar."""
+    def __init__(self, stage_name):
+        super().__init__()
+        self.stage_name = stage_name
+        self._epoch_start = None
+
+    def on_train_begin(self, logs=None):
+        log(f"[{self.stage_name}] Training started. "
+            f"Model has {self.model.count_params():,} parameters.")
+
+    def on_epoch_begin(self, epoch, logs=None):
+        self._epoch_start = time.time()
+
+    def on_epoch_end(self, epoch, logs=None):
+        duration = time.time() - self._epoch_start
+        logs = logs or {}
+        try:
+            lr_schedule = self.model.optimizer.learning_rate
+            current_step = self.model.optimizer.iterations
+            current_lr = float(lr_schedule(current_step)) if callable(lr_schedule) else float(lr_schedule)
+        except Exception:
+            current_lr = float('nan')
+        metrics_str = ", ".join(f"{k}={v:.4f}" for k, v in logs.items())
+        log(f"[{self.stage_name}] Epoch {epoch + 1} finished in {duration:.1f}s "
+            f"| lr={current_lr:.2e} | {metrics_str}")
+
+    def on_train_end(self, logs=None):
+        log(f"[{self.stage_name}] Training finished.")
+
+
 def build_model(input_dim, num_classes):
     inp = layers.Input(shape=(input_dim,))
     x = NumericFeatureTokenizer(input_dim, D_MODEL)(inp)
@@ -576,29 +685,37 @@ def evaluate(model, ds, y_true, labels, prefix):
 # =========================
 cw_bin = compute_class_weight(class_weight="balanced", classes=np.unique(y_bin_train), y=y_bin_train)
 class_weight_bin = {i: w for i, w in zip(np.unique(y_bin_train), cw_bin)}
+log(f"Binary class weights: {class_weight_bin}")
 
 cw_multi = compute_class_weight(class_weight="balanced", classes=np.unique(y_multi_train), y=y_multi_train)
 class_weight_multi = {i: w for i, w in zip(np.unique(y_multi_train), cw_multi)}
+log(f"Multiclass class weights: "
+    f"{ {multi_encoder.classes_[k]: round(v, 3) for k, v in class_weight_multi.items()} }")
 
 # =========================
 # Binary model training
 # =========================
+log("Building binary model...")
 binary_model = build_model(X_bin_train.shape[1], 2)
 binary_model.compile(
     optimizer=make_optimizer(train_ds_bin, MAX_EPOCHS),
     loss=focal_loss if USE_FOCAL_LOSS else tf.keras.losses.CategoricalCrossentropy(label_smoothing=LABEL_SMOOTHING),
     metrics=["accuracy"],
 )
+log(f"Binary model built: {binary_model.count_params():,} total parameters.")
 
 callbacks_bin = [
     EarlyStopping(monitor="val_loss", patience=PATIENCE, restore_best_weights=True),
     ModelCheckpoint(os.path.join(OUTPUT_DIR, "best_binary.keras"), monitor="val_loss", save_best_only=True, verbose=1),
+    VerboseEpochLogger("BINARY"),
 ]
 
+log("Starting binary model training...")
 history_bin = binary_model.fit(
     train_ds_bin, validation_data=val_ds_bin, epochs=MAX_EPOCHS,
     class_weight=class_weight_bin, callbacks=callbacks_bin, verbose=1,
 )
+log("Binary training complete. Loading best checkpoint...")
 
 binary_loaded = tf.keras.models.load_model(
     os.path.join(OUTPUT_DIR, "best_binary.keras"),
@@ -610,13 +727,16 @@ binary_loaded = tf.keras.models.load_model(
     },
     compile=False,
 )
+log("Best binary checkpoint loaded. Running evaluation on test set...")
 
 bin_pred, bin_prob = evaluate(binary_loaded, test_ds_bin, y_test_bin, ["Normal", "Attack"], "BINARY")
 plot_history(history_bin, "Binary Classification", "binary_history")
+log("Binary stage complete.")
 
 # =========================
 # Multi-class model training
 # =========================
+log("Building multiclass model...")
 multi_labels = list(multi_encoder.classes_)
 multi_model = build_model(X_multi_train.shape[1], num_multi_classes)
 multi_model.compile(
@@ -624,16 +744,20 @@ multi_model.compile(
     loss=focal_loss if USE_FOCAL_LOSS else tf.keras.losses.CategoricalCrossentropy(label_smoothing=LABEL_SMOOTHING),
     metrics=["accuracy"],
 )
+log(f"Multiclass model built: {multi_model.count_params():,} total parameters.")
 
 callbacks_multi = [
     EarlyStopping(monitor="val_loss", patience=PATIENCE, restore_best_weights=True),
     ModelCheckpoint(os.path.join(OUTPUT_DIR, "best_multi.keras"), monitor="val_loss", save_best_only=True, verbose=1),
+    VerboseEpochLogger("MULTICLASS"),
 ]
 
+log("Starting multiclass model training...")
 history_multi = multi_model.fit(
     train_ds_multi, validation_data=val_ds_multi, epochs=MAX_EPOCHS,
     class_weight=class_weight_multi, callbacks=callbacks_multi, verbose=1,
 )
+log("Multiclass training complete. Loading best checkpoint...")
 
 multi_loaded = tf.keras.models.load_model(
     os.path.join(OUTPUT_DIR, "best_multi.keras"),
@@ -645,9 +769,11 @@ multi_loaded = tf.keras.models.load_model(
     },
     compile=False,
 )
+log("Best multiclass checkpoint loaded. Running evaluation on test set...")
 
 multi_pred, multi_prob = evaluate(multi_loaded, test_ds_multi, y_test_multi, multi_labels, "MULTI")
 plot_history(history_multi, "Multi-class Classification", "multi_history")
+log("Multiclass stage complete.")
 
 # =========================
 # Confusion matrices
@@ -667,4 +793,5 @@ plt.tight_layout()
 plt.savefig(os.path.join(OUTPUT_DIR, "multi_confusion.png"), dpi=200)
 plt.show()
 
-print("\nAll processed datasets, models, encoders, scalers, and plots are saved in output/")
+log(f"All processed datasets, models, encoders, scalers, and plots saved in {OUTPUT_DIR}/")
+log(f"TOTAL RUNTIME: {time.time() - START_TIME:.1f}s")
