@@ -1,1 +1,670 @@
+"""
+NSL-KDD Binary + Multiclass Transformer (One-Hot + MI Selection + SMOTE)
+==========================================================================
+CTGAN replaced with SMOTE in this version. Reason: your kernel crash was
+almost certainly TensorFlow + PyTorch (which `ctgan` uses internally)
+fighting over GPU memory/CUDA context in the same process — a common,
+often silent (no Python traceback) failure mode. SMOTE is pure
+scikit-learn/NumPy, so this removes that entire class of crash and is
+also far faster (SMOTE is near-instant; CTGAN was training a GAN per
+class for 300 epochs).
 
+Tradeoff to note explicitly for your paper: SMOTE generates synthetic
+samples via linear interpolation between a minority sample and its
+k-nearest same-class neighbors, which is a much simpler mechanism than
+CTGAN's learned generative distribution. With U2R having only a few dozen
+real training samples, the neighbor pool SMOTE interpolates within is
+small, so synthetic U2R samples cluster close to the few real ones —
+state this as a limitation rather than presenting it as equivalent to
+CTGAN.
+
+All other fixes from the previous version are retained:
+  - Complete, asserted attack_map ('spy' -> R2L).
+  - COLS includes 'difficulty' (the earlier missing-column bug that
+    caused pandas to silently shift every column name by one).
+  - One-hot vocabulary built from TRAIN ONLY, test reindexed onto it.
+  - log1p on skewed numeric columns before scaling.
+  - Zero-variance / high-correlation feature dropping (train-derived).
+  - MI feature selection unions top features from BOTH binary and
+    multiclass scoring.
+  - NumericFeatureTokenizer (per-feature weight+bias, not a shared Dense).
+  - WarmupCosine.get_config() present (required for ModelCheckpoint save).
+  - ReduceLROnPlateau excluded (incompatible with a LearningRateSchedule
+    optimizer).
+  - Per-class FPR/TPR reporting.
+
+pip install tensorflow scikit-learn pandas numpy matplotlib seaborn joblib imbalanced-learn
+"""
+
+import os
+import random
+import warnings
+warnings.filterwarnings('ignore')
+
+import numpy as np
+import pandas as pd
+import tensorflow as tf
+import matplotlib.pyplot as plt
+import seaborn as sns
+import joblib
+
+from sklearn.preprocessing import LabelEncoder, StandardScaler
+from sklearn.model_selection import train_test_split
+from sklearn.feature_selection import mutual_info_classif
+from sklearn.utils.class_weight import compute_class_weight
+from sklearn.metrics import classification_report, confusion_matrix, accuracy_score, f1_score
+
+from imblearn.over_sampling import SMOTE, RandomOverSampler
+
+from tensorflow.keras import layers, Model, constraints
+from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint
+from tensorflow.keras.utils import to_categorical
+
+# =========================
+# Reproducibility
+# =========================
+RANDOM_STATE = 42
+os.environ["PYTHONHASHSEED"] = str(RANDOM_STATE)
+random.seed(RANDOM_STATE)
+np.random.seed(RANDOM_STATE)
+tf.random.set_seed(RANDOM_STATE)
+
+# =========================
+# Config
+# =========================
+TRAIN_PATH = "nsl-kdd/KDDTrain+.txt"
+TEST_PATH = "nsl-kdd/KDDTest+.txt"
+OUTPUT_DIR = "output"
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+BATCH_SIZE = 128
+MAX_EPOCHS = 80
+PATIENCE = 12
+
+D_MODEL = 64
+NUM_HEADS = 4
+FF_DIM = 128
+NUM_TRANSFORMER_BLOCKS = 4
+DROPOUT = 0.30
+LABEL_SMOOTHING = 0.03
+USE_FOCAL_LOSS = True
+BASE_LR = 3e-4
+WEIGHT_DECAY = 1e-4
+MAX_NORM_VALUE = 2.0
+WARMUP_EPOCHS = 5
+
+# =========================
+# SMOTE config
+# =========================
+USE_SMOTE = True
+SMOTE_K_NEIGHBORS_MAX = 5     # sklearn default; reduced automatically per-call if a class is smaller
+R2L_TARGET_MULT = 5           # target count = min(original_count * mult, cap)
+U2R_TARGET_MULT = 10          # U2R is far rarer, so a larger multiplier is used
+SMOTE_MAX_TARGET_R2L = 3000
+SMOTE_MAX_TARGET_U2R = 3000
+
+# MI-selected feature budget PER LABEL SCHEME before union.
+MI_TOP_N_BINARY = 35
+MI_TOP_N_MULTI = 35
+
+# =========================
+# Columns
+# =========================
+COLS = ['duration', 'protocol_type', 'service', 'flag', 'src_bytes', 'dst_bytes', 'land',
+        'wrong_fragment', 'urgent', 'hot', 'num_failed_logins', 'logged_in', 'num_compromised',
+        'root_shell', 'su_attempted', 'num_root', 'num_file_creations', 'num_shells',
+        'num_access_files', 'num_outbound_cmds', 'is_host_login', 'is_guest_login',
+        'count', 'srv_count', 'serror_rate', 'srv_serror_rate', 'rerror_rate',
+        'srv_rerror_rate', 'same_srv_rate', 'diff_srv_rate', 'srv_diff_host_rate',
+        'dst_host_count', 'dst_host_srv_count', 'dst_host_same_srv_rate',
+        'dst_host_diff_srv_rate', 'dst_host_same_src_port_rate',
+        'dst_host_srv_diff_host_rate', 'dst_host_serror_rate',
+        'dst_host_srv_serror_rate', 'dst_host_rerror_rate',
+        'dst_host_srv_rerror_rate', 'labels', 'difficulty']
+
+feature_cols = [c for c in COLS if c not in ('labels', 'difficulty')]
+categorical_cols = ['protocol_type', 'service', 'flag']
+numeric_cols = [c for c in feature_cols if c not in categorical_cols]
+skewed_cols = ['duration', 'src_bytes', 'dst_bytes', 'hot', 'num_compromised',
+               'count', 'srv_count', 'dst_host_count', 'dst_host_srv_count']
+
+# =========================
+# Load data
+# =========================
+def load_nslkdd(file_path):
+    df = pd.read_csv(file_path, names=COLS, header=None)
+    df['labels'] = df['labels'].astype(str).str.strip().str.replace('.', '', regex=False)
+    return df
+
+
+train_raw = load_nslkdd(TRAIN_PATH)
+test_raw = load_nslkdd(TEST_PATH)
+
+# =========================
+# Label mapping (complete, asserted; 'spy' -> R2L)
+# =========================
+attack_map = {
+    'normal': 'Normal',
+    'back': 'DoS', 'land': 'DoS', 'neptune': 'DoS', 'pod': 'DoS', 'smurf': 'DoS',
+    'teardrop': 'DoS', 'mailbomb': 'DoS', 'processtable': 'DoS', 'udpstorm': 'DoS',
+    'apache2': 'DoS', 'worm': 'DoS',
+    'satan': 'Probe', 'ipsweep': 'Probe', 'nmap': 'Probe', 'portsweep': 'Probe',
+    'mscan': 'Probe', 'saint': 'Probe',
+    'guess_passwd': 'R2L', 'ftp_write': 'R2L', 'imap': 'R2L', 'phf': 'R2L',
+    'multihop': 'R2L', 'warezmaster': 'R2L', 'warezclient': 'R2L', 'spy': 'R2L',
+    'snmpguess': 'R2L', 'snmpgetattack': 'R2L', 'httptunnel': 'R2L',
+    'sendmail': 'R2L', 'named': 'R2L', 'xlock': 'R2L', 'xsnoop': 'R2L',
+    'buffer_overflow': 'U2R', 'loadmodule': 'U2R', 'perl': 'U2R', 'rootkit': 'U2R',
+    'sqlattack': 'U2R', 'xterm': 'U2R', 'ps': 'U2R',
+}
+
+train_raw['attack_type'] = train_raw['labels'].map(attack_map)
+test_raw['attack_type'] = test_raw['labels'].map(attack_map)
+
+assert train_raw['attack_type'].isna().sum() == 0, \
+    f"Unmapped train labels: {train_raw.loc[train_raw['attack_type'].isna(), 'labels'].unique()}"
+assert test_raw['attack_type'].isna().sum() == 0, \
+    f"Unmapped test labels: {test_raw.loc[test_raw['attack_type'].isna(), 'labels'].unique()}"
+
+train_raw['binary_label'] = (train_raw['labels'] != 'normal').astype(int)
+test_raw['binary_label'] = (test_raw['labels'] != 'normal').astype(int)
+
+multi_order = ['Normal', 'DoS', 'Probe', 'R2L', 'U2R']
+multi_encoder = LabelEncoder().fit(multi_order)
+
+train_raw['attack_type_enc'] = multi_encoder.transform(train_raw['attack_type'])
+test_raw['attack_type_enc'] = multi_encoder.transform(test_raw['attack_type'])
+train_raw['binary_label_enc'] = train_raw['binary_label'].astype(int)
+test_raw['binary_label_enc'] = test_raw['binary_label'].astype(int)
+
+print("Train attack_type distribution:\n", train_raw['attack_type'].value_counts())
+print("\nTest attack_type distribution:\n", test_raw['attack_type'].value_counts())
+
+# =========================
+# log1p on skewed columns
+# =========================
+for c in skewed_cols:
+    train_raw[c] = np.log1p(train_raw[c].astype(np.float32))
+    test_raw[c] = np.log1p(test_raw[c].astype(np.float32))
+
+# =========================
+# One-hot encode categorical columns (TRAIN-ONLY schema)
+# =========================
+train_ohe = pd.get_dummies(train_raw[feature_cols], columns=categorical_cols, drop_first=True)
+ohe_columns = train_ohe.columns.tolist()
+
+test_ohe = pd.get_dummies(test_raw[feature_cols], columns=categorical_cols, drop_first=True)
+test_ohe = test_ohe.reindex(columns=ohe_columns, fill_value=0)
+
+# =========================
+# Drop zero-variance features (train-derived)
+# =========================
+zero_var_cols = [c for c in train_ohe.columns if train_ohe[c].nunique() <= 1]
+train_ohe.drop(columns=zero_var_cols, inplace=True)
+test_ohe.drop(columns=zero_var_cols, inplace=True)
+
+# =========================
+# Drop highly collinear features (train-derived)
+# =========================
+corr_matrix = train_ohe.corr().abs()
+upper = corr_matrix.where(np.triu(np.ones(corr_matrix.shape), k=1).astype(bool))
+to_drop_corr = [col for col in upper.columns if any(upper[col] > 0.95)]
+train_ohe.drop(columns=to_drop_corr, inplace=True)
+test_ohe.drop(columns=to_drop_corr, inplace=True)
+
+# =========================
+# Mutual information feature selection (union of binary + multiclass)
+# =========================
+mi_bin = mutual_info_classif(train_ohe, train_raw['binary_label_enc'], random_state=RANDOM_STATE)
+mi_bin_df = pd.DataFrame({'feature': train_ohe.columns, 'mi_score': mi_bin}).sort_values('mi_score', ascending=False)
+top_bin = mi_bin_df.head(min(MI_TOP_N_BINARY, len(mi_bin_df)))['feature'].tolist()
+
+mi_multi = mutual_info_classif(train_ohe, train_raw['attack_type_enc'], random_state=RANDOM_STATE)
+mi_multi_df = pd.DataFrame({'feature': train_ohe.columns, 'mi_score': mi_multi}).sort_values('mi_score', ascending=False)
+top_multi = mi_multi_df.head(min(MI_TOP_N_MULTI, len(mi_multi_df)))['feature'].tolist()
+
+selected_features = sorted(set(top_bin) | set(top_multi))
+print(f"\nSelected {len(selected_features)} features "
+      f"({len(top_bin)} from binary MI, {len(top_multi)} from multiclass MI, "
+      f"{len(set(top_bin) & set(top_multi))} overlap)")
+
+train_sel = train_ohe[selected_features].copy()
+test_sel = test_ohe[selected_features].copy()
+
+# =========================
+# Balance with SMOTE
+# =========================
+def smote_balance(X_df, y_series, target_counts=None, k_neighbors_max=SMOTE_K_NEIGHBORS_MAX):
+    """
+    If target_counts is None: SMOTE with sampling_strategy='auto' (every
+    minority class oversampled to match the majority class count).
+    If target_counts is a dict {class_label: desired_count}: only those
+    classes are oversampled, to the given target (classes not listed are
+    left untouched).
+
+    k_neighbors is reduced automatically to stay valid for the smallest
+    class being oversampled. If that class has fewer than 2 real samples,
+    SMOTE cannot interpolate at all and RandomOverSampler (exact
+    duplication) is used instead as a safe fallback.
+    """
+    if not USE_SMOTE:
+        return X_df.reset_index(drop=True), y_series.reset_index(drop=True)
+
+    counts = y_series.value_counts()
+
+    if target_counts is None:
+        sampling_strategy = 'auto'
+        relevant_counts = counts
+    else:
+        sampling_strategy = {
+            cls: target for cls, target in target_counts.items()
+            if target > counts.get(cls, 0)
+        }
+        if not sampling_strategy:
+            print("No classes need oversampling under the given targets; skipping SMOTE.")
+            return X_df.reset_index(drop=True), y_series.reset_index(drop=True)
+        relevant_counts = {cls: counts.get(cls, 0) for cls in sampling_strategy}
+
+    min_relevant_count = min(relevant_counts.values()) if isinstance(relevant_counts, dict) else relevant_counts.min()
+
+    if min_relevant_count < 2:
+        print(f"A target class has fewer than 2 real samples ({min_relevant_count}); "
+              f"SMOTE cannot interpolate. Falling back to RandomOverSampler (exact "
+              f"duplication, not synthetic) for this call.")
+        ros = RandomOverSampler(sampling_strategy=sampling_strategy, random_state=RANDOM_STATE)
+        X_res, y_res = ros.fit_resample(X_df, y_series)
+        return (pd.DataFrame(X_res, columns=X_df.columns).reset_index(drop=True),
+                pd.Series(y_res, name=y_series.name).reset_index(drop=True))
+
+    k = min(k_neighbors_max, min_relevant_count - 1)
+    sm = SMOTE(sampling_strategy=sampling_strategy, k_neighbors=k, random_state=RANDOM_STATE)
+    X_res, y_res = sm.fit_resample(X_df, y_series)
+    return (pd.DataFrame(X_res, columns=X_df.columns).reset_index(drop=True),
+            pd.Series(y_res, name=y_series.name).reset_index(drop=True))
+
+
+# --- Binary: balance Normal vs Attack to match the majority ---
+X_bin_balanced, y_bin_balanced = smote_balance(train_sel, train_raw['binary_label_enc'])
+
+perm_bin = np.random.RandomState(RANDOM_STATE).permutation(len(X_bin_balanced))
+X_bin_balanced = X_bin_balanced.iloc[perm_bin].reset_index(drop=True)
+y_bin_balanced = y_bin_balanced.iloc[perm_bin].reset_index(drop=True)
+
+# --- Multiclass: target R2L and U2R directly, leave Normal/DoS/Probe alone ---
+r2l_cls = multi_encoder.transform(['R2L'])[0]
+u2r_cls = multi_encoder.transform(['U2R'])[0]
+
+multi_counts = train_raw['attack_type_enc'].value_counts()
+r2l_target = min(int(multi_counts.get(r2l_cls, 0) * R2L_TARGET_MULT), SMOTE_MAX_TARGET_R2L)
+u2r_target = min(int(multi_counts.get(u2r_cls, 0) * U2R_TARGET_MULT), SMOTE_MAX_TARGET_U2R)
+print(f"\nSMOTE targets — R2L: {multi_counts.get(r2l_cls, 0)} -> {r2l_target}, "
+      f"U2R: {multi_counts.get(u2r_cls, 0)} -> {u2r_target}")
+
+X_multi_balanced, y_multi_balanced = smote_balance(
+    train_sel, train_raw['attack_type_enc'],
+    target_counts={r2l_cls: r2l_target, u2r_cls: u2r_target},
+)
+
+perm_multi = np.random.RandomState(RANDOM_STATE).permutation(len(X_multi_balanced))
+X_multi_balanced = X_multi_balanced.iloc[perm_multi].reset_index(drop=True)
+y_multi_balanced = y_multi_balanced.iloc[perm_multi].reset_index(drop=True)
+
+print("\nPost-SMOTE binary distribution:\n", y_bin_balanced.value_counts())
+print("\nPost-SMOTE multiclass distribution:\n",
+      y_multi_balanced.map(lambda i: multi_encoder.classes_[i]).value_counts())
+
+# =========================
+# Save processed datasets
+# =========================
+processed_dir = os.path.join(OUTPUT_DIR, "processed")
+os.makedirs(processed_dir, exist_ok=True)
+
+bin_processed = X_bin_balanced.copy()
+bin_processed['binary_label'] = y_bin_balanced.values
+bin_processed.to_csv(os.path.join(processed_dir, 'nslkdd_binary_balanced.csv'), index=False)
+
+multi_processed = X_multi_balanced.copy()
+multi_processed['attack_type_enc'] = y_multi_balanced.values
+multi_processed.to_csv(os.path.join(processed_dir, 'nslkdd_multiclass_balanced.csv'), index=False)
+
+test_sel.assign(binary_label=test_raw['binary_label_enc'].values).to_csv(
+    os.path.join(processed_dir, 'nslkdd_binary_test.csv'), index=False)
+test_sel.assign(attack_type_enc=test_raw['attack_type_enc'].values).to_csv(
+    os.path.join(processed_dir, 'nslkdd_multiclass_test.csv'), index=False)
+
+joblib.dump(selected_features, os.path.join(processed_dir, 'selected_features.pkl'))
+joblib.dump(ohe_columns, os.path.join(processed_dir, 'ohe_columns.pkl'))
+
+# =========================
+# Scaling
+# =========================
+scaler_bin = StandardScaler()
+X_bin_bal_scaled = scaler_bin.fit_transform(X_bin_balanced.astype(np.float32))
+X_test_bin_scaled = scaler_bin.transform(test_sel.astype(np.float32))
+joblib.dump(scaler_bin, os.path.join(processed_dir, 'scaler_binary.pkl'))
+
+scaler_multi = StandardScaler()
+X_multi_bal_scaled = scaler_multi.fit_transform(X_multi_balanced.astype(np.float32))
+X_test_multi_scaled = scaler_multi.transform(test_sel.astype(np.float32))
+joblib.dump(scaler_multi, os.path.join(processed_dir, 'scaler_multi.pkl'))
+
+# =========================
+# Train/val split
+# =========================
+X_bin_train, X_bin_val, y_bin_train, y_bin_val = train_test_split(
+    X_bin_bal_scaled, y_bin_balanced.values, test_size=0.2, random_state=RANDOM_STATE, stratify=y_bin_balanced.values
+)
+X_multi_train, X_multi_val, y_multi_train, y_multi_val = train_test_split(
+    X_multi_bal_scaled, y_multi_balanced.values, test_size=0.2, random_state=RANDOM_STATE, stratify=y_multi_balanced.values
+)
+
+X_test_bin = X_test_bin_scaled.astype(np.float32)
+y_test_bin = test_raw['binary_label_enc'].values
+
+X_test_multi = X_test_multi_scaled.astype(np.float32)
+y_test_multi = test_raw['attack_type_enc'].values
+
+X_bin_train = X_bin_train.astype(np.float32)
+X_bin_val = X_bin_val.astype(np.float32)
+X_multi_train = X_multi_train.astype(np.float32)
+X_multi_val = X_multi_val.astype(np.float32)
+
+y_bin_train_cat = to_categorical(y_bin_train, num_classes=2)
+y_bin_val_cat = to_categorical(y_bin_val, num_classes=2)
+y_test_bin_cat = to_categorical(y_test_bin, num_classes=2)
+
+num_multi_classes = len(multi_order)  # fixed at 5
+y_multi_train_cat = to_categorical(y_multi_train, num_classes=num_multi_classes)
+y_multi_val_cat = to_categorical(y_multi_val, num_classes=num_multi_classes)
+y_test_multi_cat = to_categorical(y_test_multi, num_classes=num_multi_classes)
+
+# =========================
+# tf.data
+# =========================
+def make_ds(X, y, training=False):
+    ds = tf.data.Dataset.from_tensor_slices((X, y))
+    if training:
+        ds = ds.shuffle(20000, seed=RANDOM_STATE, reshuffle_each_iteration=True)
+    return ds.batch(BATCH_SIZE).prefetch(tf.data.AUTOTUNE)
+
+
+train_ds_bin = make_ds(X_bin_train, y_bin_train_cat, training=True)
+val_ds_bin = make_ds(X_bin_val, y_bin_val_cat, training=False)
+test_ds_bin = make_ds(X_test_bin, y_test_bin_cat, training=False)
+
+train_ds_multi = make_ds(X_multi_train, y_multi_train_cat, training=True)
+val_ds_multi = make_ds(X_multi_val, y_multi_val_cat, training=False)
+test_ds_multi = make_ds(X_test_multi, y_test_multi_cat, training=False)
+
+# =========================
+# Loss
+# =========================
+@tf.keras.utils.register_keras_serializable()
+def focal_loss(y_true, y_pred, gamma=2.0, alpha=0.25):
+    y_pred = tf.clip_by_value(y_pred, tf.keras.backend.epsilon(), 1.0 - tf.keras.backend.epsilon())
+    ce = -y_true * tf.math.log(y_pred)
+    w = alpha * tf.pow(1.0 - y_pred, gamma)
+    return tf.reduce_sum(w * ce, axis=1)
+
+
+@tf.keras.utils.register_keras_serializable()
+class WarmupCosine(tf.keras.optimizers.schedules.LearningRateSchedule):
+    def __init__(self, base_lr, warmup_steps, total_steps, **kwargs):
+        super().__init__()
+        self.base_lr = base_lr
+        self.warmup_steps = warmup_steps
+        self.total_steps = total_steps
+
+    def __call__(self, step):
+        step = tf.cast(step, tf.float32)
+        warm = tf.cast(self.warmup_steps, tf.float32)
+        total = tf.cast(self.total_steps, tf.float32)
+        return tf.where(
+            step < warm,
+            self.base_lr * (step / tf.maximum(1.0, warm)),
+            0.5 * self.base_lr * (1.0 + tf.cos(np.pi * (step - warm) / tf.maximum(1.0, total - warm))),
+        )
+
+    def get_config(self):
+        return {"base_lr": self.base_lr, "warmup_steps": self.warmup_steps, "total_steps": self.total_steps}
+
+
+@tf.keras.utils.register_keras_serializable()
+class NumericFeatureTokenizer(layers.Layer):
+    def __init__(self, num_features, d_model, **kwargs):
+        super().__init__(**kwargs)
+        self.num_features = num_features
+        self.d_model = d_model
+
+    def build(self, input_shape):
+        self.weight = self.add_weight(
+            shape=(self.num_features, self.d_model), initializer="glorot_uniform",
+            trainable=True, name="numeric_weight",
+        )
+        self.bias = self.add_weight(
+            shape=(self.num_features, self.d_model), initializer="zeros",
+            trainable=True, name="numeric_bias",
+        )
+
+    def call(self, inputs):
+        x = tf.expand_dims(inputs, axis=-1)
+        return x * self.weight + self.bias
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({"num_features": self.num_features, "d_model": self.d_model})
+        return config
+
+
+@tf.keras.utils.register_keras_serializable()
+class TransformerBlock(layers.Layer):
+    def __init__(self, d_model, num_heads, ff_dim, dropout=0.1, **kwargs):
+        super().__init__(**kwargs)
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.ff_dim = ff_dim
+        self.dropout_rate = dropout
+        self.att = layers.MultiHeadAttention(num_heads=num_heads, key_dim=max(1, d_model // num_heads))
+        self.ffn = tf.keras.Sequential([
+            layers.Dense(ff_dim, activation="relu"),
+            layers.Dropout(dropout),
+            layers.Dense(d_model),
+        ])
+        self.norm1 = layers.LayerNormalization(epsilon=1e-6)
+        self.norm2 = layers.LayerNormalization(epsilon=1e-6)
+        self.drop1 = layers.Dropout(dropout)
+        self.drop2 = layers.Dropout(dropout)
+
+    def call(self, inputs, training=False):
+        x = self.norm1(inputs)
+        attn = self.att(x, x, training=training)
+        attn = self.drop1(attn, training=training)
+        x = inputs + attn
+        y = self.norm2(x)
+        y = self.ffn(y, training=training)
+        y = self.drop2(y, training=training)
+        return x + y
+
+    def get_config(self):
+        cfg = super().get_config()
+        cfg.update({
+            "d_model": self.d_model, "num_heads": self.num_heads,
+            "ff_dim": self.ff_dim, "dropout": self.dropout_rate,
+        })
+        return cfg
+
+
+def build_model(input_dim, num_classes):
+    inp = layers.Input(shape=(input_dim,))
+    x = NumericFeatureTokenizer(input_dim, D_MODEL)(inp)
+    x = layers.LayerNormalization(epsilon=1e-6)(x)
+
+    positions = tf.range(start=0, limit=input_dim, delta=1)
+    pos_emb = layers.Embedding(input_dim=input_dim, output_dim=D_MODEL)
+    x = x + pos_emb(positions)
+    x = layers.SpatialDropout1D(DROPOUT)(x)
+
+    for _ in range(NUM_TRANSFORMER_BLOCKS):
+        x = TransformerBlock(D_MODEL, NUM_HEADS, FF_DIM, dropout=DROPOUT)(x)
+
+    x = layers.GlobalAveragePooling1D()(x)
+    x = layers.Dense(128, activation="relu", kernel_constraint=constraints.MaxNorm(MAX_NORM_VALUE))(x)
+    x = layers.Dropout(DROPOUT)(x)
+    x = layers.Dense(64, activation="relu", kernel_constraint=constraints.MaxNorm(MAX_NORM_VALUE))(x)
+    x = layers.Dropout(DROPOUT)(x)
+    out = layers.Dense(num_classes, activation="softmax")(x)
+    return Model(inp, out)
+
+
+def make_optimizer(train_ds, epochs):
+    steps_per_epoch = tf.data.experimental.cardinality(train_ds).numpy()
+    total_steps = max(1, steps_per_epoch * epochs)
+    warmup_steps = max(1, steps_per_epoch * WARMUP_EPOCHS)
+    lr_schedule = WarmupCosine(BASE_LR, warmup_steps, total_steps)
+    return tf.keras.optimizers.AdamW(learning_rate=lr_schedule, weight_decay=WEIGHT_DECAY)
+
+
+def plot_history(history, title, fname):
+    plt.figure(figsize=(12, 5))
+    plt.subplot(1, 2, 1)
+    plt.plot(history.history["accuracy"], label="Train")
+    plt.plot(history.history["val_accuracy"], label="Val")
+    plt.legend(); plt.title(f"{title} Accuracy")
+    plt.subplot(1, 2, 2)
+    plt.plot(history.history["loss"], label="Train")
+    plt.plot(history.history["val_loss"], label="Val")
+    plt.legend(); plt.title(f"{title} Loss")
+    plt.tight_layout()
+    plt.savefig(os.path.join(OUTPUT_DIR, f"{fname}.png"), dpi=200)
+    plt.show()
+
+
+def evaluate(model, ds, y_true, labels, prefix):
+    prob = model.predict(ds, verbose=0)
+    pred = np.argmax(prob, axis=1)
+    acc = accuracy_score(y_true, pred)
+    mf1 = f1_score(y_true, pred, average="macro", zero_division=0)
+    rep = classification_report(y_true, pred, target_names=labels, digits=4, zero_division=0)
+    print(f"\n===== {prefix} =====")
+    print("Accuracy:", round(acc, 4))
+    print("Macro F1:", round(mf1, 4))
+    print(rep)
+
+    cm = confusion_matrix(y_true, pred, labels=range(len(labels)))
+    print(f"{'Class':<10}{'TPR(Recall)':<14}{'FPR':<10}{'FP':<6}{'TN':<8}")
+    fpr_dict = {}
+    for i, cname in enumerate(labels):
+        tp = cm[i, i]
+        fn = cm[i, :].sum() - tp
+        fp = cm[:, i].sum() - tp
+        tn = cm.sum() - tp - fn - fp
+        tpr = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+        fpr = fp / (fp + tn) if (fp + tn) > 0 else 0.0
+        fpr_dict[cname] = fpr
+        print(f"{cname:<10}{tpr:<14.4f}{fpr:<10.4f}{fp:<6}{tn:<8}")
+    mean_fpr = np.mean(list(fpr_dict.values()))
+    print(f"\nMean per-class FPR: {mean_fpr:.4f}")
+
+    with open(os.path.join(OUTPUT_DIR, f"{prefix.lower()}_report.txt"), "w") as f:
+        f.write(f"Accuracy: {acc:.4f}\nMacro F1: {mf1:.4f}\nMean per-class FPR: {mean_fpr:.4f}\n\n")
+        f.write(rep)
+    return pred, prob
+
+
+# =========================
+# Class weights
+# =========================
+cw_bin = compute_class_weight(class_weight="balanced", classes=np.unique(y_bin_train), y=y_bin_train)
+class_weight_bin = {i: w for i, w in zip(np.unique(y_bin_train), cw_bin)}
+
+cw_multi = compute_class_weight(class_weight="balanced", classes=np.unique(y_multi_train), y=y_multi_train)
+class_weight_multi = {i: w for i, w in zip(np.unique(y_multi_train), cw_multi)}
+
+# =========================
+# Binary model training
+# =========================
+binary_model = build_model(X_bin_train.shape[1], 2)
+binary_model.compile(
+    optimizer=make_optimizer(train_ds_bin, MAX_EPOCHS),
+    loss=focal_loss if USE_FOCAL_LOSS else tf.keras.losses.CategoricalCrossentropy(label_smoothing=LABEL_SMOOTHING),
+    metrics=["accuracy"],
+)
+
+callbacks_bin = [
+    EarlyStopping(monitor="val_loss", patience=PATIENCE, restore_best_weights=True),
+    ModelCheckpoint(os.path.join(OUTPUT_DIR, "best_binary.keras"), monitor="val_loss", save_best_only=True, verbose=1),
+]
+
+history_bin = binary_model.fit(
+    train_ds_bin, validation_data=val_ds_bin, epochs=MAX_EPOCHS,
+    class_weight=class_weight_bin, callbacks=callbacks_bin, verbose=1,
+)
+
+binary_loaded = tf.keras.models.load_model(
+    os.path.join(OUTPUT_DIR, "best_binary.keras"),
+    custom_objects={
+        "TransformerBlock": TransformerBlock,
+        "NumericFeatureTokenizer": NumericFeatureTokenizer,
+        "focal_loss": focal_loss,
+        "WarmupCosine": WarmupCosine,
+    },
+    compile=False,
+)
+
+bin_pred, bin_prob = evaluate(binary_loaded, test_ds_bin, y_test_bin, ["Normal", "Attack"], "BINARY")
+plot_history(history_bin, "Binary Classification", "binary_history")
+
+# =========================
+# Multi-class model training
+# =========================
+multi_labels = list(multi_encoder.classes_)
+multi_model = build_model(X_multi_train.shape[1], num_multi_classes)
+multi_model.compile(
+    optimizer=make_optimizer(train_ds_multi, MAX_EPOCHS),
+    loss=focal_loss if USE_FOCAL_LOSS else tf.keras.losses.CategoricalCrossentropy(label_smoothing=LABEL_SMOOTHING),
+    metrics=["accuracy"],
+)
+
+callbacks_multi = [
+    EarlyStopping(monitor="val_loss", patience=PATIENCE, restore_best_weights=True),
+    ModelCheckpoint(os.path.join(OUTPUT_DIR, "best_multi.keras"), monitor="val_loss", save_best_only=True, verbose=1),
+]
+
+history_multi = multi_model.fit(
+    train_ds_multi, validation_data=val_ds_multi, epochs=MAX_EPOCHS,
+    class_weight=class_weight_multi, callbacks=callbacks_multi, verbose=1,
+)
+
+multi_loaded = tf.keras.models.load_model(
+    os.path.join(OUTPUT_DIR, "best_multi.keras"),
+    custom_objects={
+        "TransformerBlock": TransformerBlock,
+        "NumericFeatureTokenizer": NumericFeatureTokenizer,
+        "focal_loss": focal_loss,
+        "WarmupCosine": WarmupCosine,
+    },
+    compile=False,
+)
+
+multi_pred, multi_prob = evaluate(multi_loaded, test_ds_multi, y_test_multi, multi_labels, "MULTI")
+plot_history(history_multi, "Multi-class Classification", "multi_history")
+
+# =========================
+# Confusion matrices
+# =========================
+plt.figure(figsize=(6, 5))
+sns.heatmap(confusion_matrix(y_test_bin, bin_pred), annot=True, fmt="d", cmap="Blues")
+plt.title("Binary Confusion Matrix"); plt.xlabel("Predicted"); plt.ylabel("True")
+plt.tight_layout()
+plt.savefig(os.path.join(OUTPUT_DIR, "binary_confusion.png"), dpi=200)
+plt.show()
+
+plt.figure(figsize=(8, 6))
+sns.heatmap(confusion_matrix(y_test_multi, multi_pred), annot=True, fmt="d", cmap="Greens",
+            xticklabels=multi_labels, yticklabels=multi_labels)
+plt.title("Multi-class Confusion Matrix"); plt.xlabel("Predicted"); plt.ylabel("True")
+plt.tight_layout()
+plt.savefig(os.path.join(OUTPUT_DIR, "multi_confusion.png"), dpi=200)
+plt.show()
+
+print("\nAll processed datasets, models, encoders, scalers, and plots are saved in output/")
