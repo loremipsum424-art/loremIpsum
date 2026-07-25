@@ -31,19 +31,51 @@ random.seed(RANDOM_STATE)
 np.random.seed(RANDOM_STATE)
 tf.random.set_seed(RANDOM_STATE)
 
+
 # =========================
-# GPU setup
+# GPU detection & configuration
 # =========================
-print("Checking GPU availability...")
-gpus = tf.config.list_physical_devices("GPU")
+import time
+START_TIME = time.time()
+ 
+ 
+def log(msg):
+    """Timestamped progress print — every major step in this script calls
+    this so you can see exactly what's running and how long each stage
+    took, rather than the notebook going silent for minutes at a time."""
+    elapsed = time.time() - START_TIME
+    print(f"[{elapsed:8.2f}s] {msg}", flush=True)
+ 
+ 
+log("Checking for GPU...")
+gpus = tf.config.list_physical_devices('GPU')
+log(f"TensorFlow built with CUDA support: {tf.test.is_built_with_cuda()}")
 if gpus:
     for gpu in gpus:
-        tf.config.experimental.set_memory_growth(gpu, True)
-    print(f"GPU(s) detected: {len(gpus)}")
-    for gpu in gpus:
-        print(f"  - {gpu.name} memory_growth=True")
+        try:
+            # Memory growth = TF allocates VRAM incrementally as needed
+            # instead of claiming ~all of it upfront. Must be set before
+            # any op touches the GPU, which is why this runs immediately
+            # after import. This is also what keeps TF from starving out
+            # other GPU consumers in the same process (relevant if you
+            # ever mix in a PyTorch-based library again).
+            tf.config.experimental.set_memory_growth(gpu, True)
+        except RuntimeError as e:
+            log(f"Could not set memory growth on {gpu.name} (GPU already "
+                f"initialized elsewhere?): {e}")
+    log(f"Found {len(gpus)} GPU(s): {[g.name for g in gpus]}")
+    with tf.device(gpus[0].name.replace('/physical_device:', '/')):
+        _test_tensor = tf.constant([1.0])
+    log(f"Test tensor placed on: {_test_tensor.device}")
 else:
-    print("No GPU detected. Running on CPU.")
+    log("No GPU detected by TensorFlow. Training will run on CPU, which will "
+        "be noticeably slower for the Transformer models. If you expect a "
+        "GPU here, verify: (1) `nvidia-smi` shows the GPU and driver, "
+        "(2) your TensorFlow build matches your installed CUDA/cuDNN "
+        "version — check with `pip show tensorflow` and TF's install guide.")
+ 
+log(f"Logical devices available: {tf.config.list_logical_devices()}")
+ 
 
 # =========================
 # Paths / config
